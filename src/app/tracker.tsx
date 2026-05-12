@@ -730,11 +730,27 @@ function MacroBox({
 
 // ─── Weekly Summary ──────────────────────────────────────────────────────────
 
-function WeeklySummary({ days, weekNum, theme }: { days: ComputedDay[]; weekNum: number; theme: Theme }) {
+interface WeekStats {
+  avgDeficit: number | null;
+  avgWeight: number | null;
+  totalCalsEaten: number;
+  totalCalsTarget: number;
+  weightStart: number | null;
+  weightEnd: number | null;
+  weightDelta: number | null;
+  sportDays: number;
+  restDays: number;
+  sugarCompliant: number;
+  sugarTracked: number;
+  trackedDays: number;
+  totalDays: number;
+  dailyCals: { target: number; actual: number | null }[];
+}
+
+function calcWeekStats(days: ComputedDay[]): WeekStats {
   const daysWithCals = days.filter((d) => d.data.actualCalories !== null);
   const daysWithWeight = days.filter((d) => d.data.weighIn !== null);
-
-  if (daysWithCals.length === 0 && daysWithWeight.length === 0) return null;
+  const daysWithSugar = days.filter((d) => d.data.actualSugar !== null);
 
   const avgDeficit =
     daysWithCals.length > 0
@@ -747,11 +763,165 @@ function WeeklySummary({ days, weekNum, theme }: { days: ComputedDay[]; weekNum:
   const avgWeight =
     daysWithWeight.length > 0
       ? Math.round(
-          (daysWithWeight.reduce((s, d) => s + (d.data.weighIn ?? 0), 0) / daysWithWeight.length) *
-            10
+          (daysWithWeight.reduce((s, d) => s + (d.data.weighIn ?? 0), 0) / daysWithWeight.length) * 10
         ) / 10
       : null;
 
+  const weightStart = daysWithWeight.length > 0 ? daysWithWeight[0].data.weighIn : null;
+  const weightEnd = daysWithWeight.length > 0 ? daysWithWeight[daysWithWeight.length - 1].data.weighIn : null;
+  const weightDelta = weightStart !== null && weightEnd !== null && daysWithWeight.length > 1
+    ? Math.round((weightEnd - weightStart) * 10) / 10
+    : null;
+
+  return {
+    avgDeficit,
+    avgWeight,
+    totalCalsEaten: daysWithCals.reduce((s, d) => s + (d.data.actualCalories ?? 0), 0),
+    totalCalsTarget: daysWithCals.reduce((s, d) => s + d.targetCalories, 0),
+    weightStart,
+    weightEnd,
+    weightDelta,
+    sportDays: days.filter((d) => d.data.isSportDay).length,
+    restDays: days.filter((d) => !d.data.isSportDay).length,
+    sugarCompliant: daysWithSugar.filter((d) => (d.data.actualSugar ?? 0) <= SUGAR_MAX_G).length,
+    sugarTracked: daysWithSugar.length,
+    trackedDays: daysWithCals.length,
+    totalDays: days.length,
+    dailyCals: days.map((d) => ({ target: d.targetCalories, actual: d.data.actualCalories })),
+  };
+}
+
+function getWeekGrade(stats: WeekStats): { label: string; color: string; emoji: string } {
+  if (stats.trackedDays === 0) return { label: "No data", color: "#64748b", emoji: "\u2014" };
+  const calDiff = stats.totalCalsTarget - stats.totalCalsEaten;
+  const compliance = stats.trackedDays / stats.totalDays;
+  if (compliance >= 0.8 && calDiff >= 0 && (stats.weightDelta === null || stats.weightDelta <= 0)) {
+    return { label: "On track", color: "#22c55e", emoji: "\uD83D\uDD25" };
+  }
+  if (compliance >= 0.5 && calDiff >= -500) {
+    return { label: "Decent", color: "#f59e0b", emoji: "\uD83D\uDC4D" };
+  }
+  return { label: "Behind", color: "#ef4444", emoji: "\u26A0\uFE0F" };
+}
+
+function getWeekInsight(stats: WeekStats, prevStats: WeekStats | null): string {
+  if (stats.trackedDays === 0) return "Start logging to see insights.";
+
+  const parts: string[] = [];
+
+  // Calorie insight
+  const calDiff = stats.totalCalsEaten - stats.totalCalsTarget;
+  if (calDiff > 500) {
+    const perDay = Math.round(calDiff / 7);
+    parts.push(`${Math.round(calDiff)} kcal over target this week. Aim for ~${perDay} less per day next week.`);
+  } else if (calDiff < -500) {
+    parts.push(`${Math.round(Math.abs(calDiff))} kcal under target \u2014 strong discipline!`);
+  } else if (stats.trackedDays >= 5) {
+    parts.push("Calories right on target.");
+  }
+
+  // Weight insight
+  if (stats.weightDelta !== null) {
+    if (stats.weightDelta < -0.3) {
+      parts.push(`Lost ${Math.abs(stats.weightDelta)} kg this week \u2014 great progress.`);
+    } else if (stats.weightDelta > 0.3) {
+      parts.push(`Weight up ${stats.weightDelta} kg. Could be water retention \u2014 stay consistent.`);
+    }
+  }
+
+  // Comparison insight
+  if (prevStats && prevStats.avgDeficit !== null && stats.avgDeficit !== null) {
+    const diff = stats.avgDeficit - prevStats.avgDeficit;
+    if (diff > 100) {
+      parts.push(`Avg deficit improved by ${Math.round(diff)} vs last week.`);
+    } else if (diff < -100) {
+      parts.push(`Avg deficit dropped by ${Math.round(Math.abs(diff))} vs last week.`);
+    }
+  }
+
+  // Tracking consistency
+  if (stats.trackedDays < stats.totalDays * 0.5) {
+    parts.push(`Only ${stats.trackedDays}/${stats.totalDays} days tracked \u2014 consistency is key.`);
+  }
+
+  // Sport encouragement
+  if (stats.sportDays >= 3) {
+    parts.push(`${stats.sportDays} sport days \u2014 keep it up!`);
+  } else if (stats.sportDays === 0 && stats.trackedDays > 0) {
+    parts.push("No sport days logged. Even one session helps.");
+  }
+
+  return parts.length > 0 ? parts.join(" ") : "Keep going!";
+}
+
+function MiniCalChart({ dailyCals, theme }: { dailyCals: WeekStats["dailyCals"]; theme: Theme }) {
+  const maxCal = Math.max(...dailyCals.map((d) => Math.max(d.target, d.actual ?? 0)), 1);
+
+  return (
+    <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 50 }}>
+      {dailyCals.map((d, i) => {
+        const targetH = (d.target / maxCal) * 44;
+        const actualH = d.actual !== null ? (d.actual / maxCal) * 44 : 0;
+        const over = d.actual !== null && d.actual > d.target;
+        return (
+          <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+            <div style={{ position: "relative", width: "100%", height: 44 }}>
+              {/* Target bar (background) */}
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  height: targetH,
+                  background: theme.border,
+                  borderRadius: 2,
+                  opacity: 0.5,
+                }}
+              />
+              {/* Actual bar (foreground) */}
+              {d.actual !== null && (
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: 0,
+                    left: "15%",
+                    right: "15%",
+                    height: actualH,
+                    background: over ? "#ef4444" : "#22c55e",
+                    borderRadius: 2,
+                  }}
+                />
+              )}
+            </div>
+            <div style={{ fontSize: 9, color: theme.textDim }}>
+              {["M", "T", "W", "T", "F", "S", "S"][i] ?? ""}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function WeeklySummary({
+  days,
+  weekNum,
+  theme,
+  prevWeekDays,
+}: {
+  days: ComputedDay[];
+  weekNum: number;
+  theme: Theme;
+  prevWeekDays: ComputedDay[] | null;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const stats = useMemo(() => calcWeekStats(days), [days]);
+  const prevStats = useMemo(() => (prevWeekDays ? calcWeekStats(prevWeekDays) : null), [prevWeekDays]);
+  const grade = useMemo(() => getWeekGrade(stats), [stats]);
+  const insight = useMemo(() => getWeekInsight(stats, prevStats), [stats, prevStats]);
+
+  const hasData = stats.trackedDays > 0 || days.some((d) => d.data.weighIn !== null);
   const mono: CSSProperties = { fontFamily: "'JetBrains Mono', monospace" };
 
   return (
@@ -760,34 +930,214 @@ function WeeklySummary({ days, weekNum, theme }: { days: ComputedDay[]; weekNum:
         background: `linear-gradient(135deg, ${theme.card} 0%, ${theme.bg} 100%)`,
         border: `1px solid ${theme.inputBorder}`,
         borderRadius: 10,
-        padding: "10px 14px",
         marginBottom: 8,
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        fontSize: 12,
+        overflow: "hidden",
+        transition: "box-shadow 0.2s",
       }}
     >
-      <span style={{ fontWeight: 600, color: "#a855f7" }}>Week {weekNum} Summary</span>
-      <div style={{ display: "flex", gap: 16, ...mono }}>
-        {avgDeficit !== null && (
-          <span>
-            Avg deficit:{" "}
-            <span style={{ color: "#22c55e", fontWeight: 600 }}>{avgDeficit}</span>
+      {/* Header — always visible */}
+      <div
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          padding: "10px 14px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          fontSize: 12,
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontWeight: 700, color: "#a855f7", fontSize: 13 }}>W{weekNum}</span>
+          <span style={{ color: grade.color, fontWeight: 600, fontSize: 11 }}>
+            {grade.emoji} {grade.label}
           </span>
-        )}
-        {avgWeight !== null && (
-          <span>
-            Avg weight:{" "}
-            <span style={{ color: "#60a5fa", fontWeight: 600 }}>{avgWeight} kg</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, ...mono }}>
+          {stats.avgDeficit !== null && (
+            <span style={{ fontSize: 11 }}>
+              <span style={{ color: theme.textMuted }}>def </span>
+              <span style={{ color: "#22c55e", fontWeight: 600 }}>{stats.avgDeficit}</span>
+            </span>
+          )}
+          {stats.avgWeight !== null && (
+            <span style={{ fontSize: 11 }}>
+              <span style={{ color: theme.textMuted }}>avg </span>
+              <span style={{ color: "#60a5fa", fontWeight: 600 }}>{stats.avgWeight}kg</span>
+            </span>
+          )}
+          <span style={{ fontSize: 11 }}>
+            <span style={{ color: theme.text, fontWeight: 600 }}>
+              {stats.trackedDays}/{stats.totalDays}
+            </span>
           </span>
-        )}
-        <span>
-          Tracked:{" "}
-          <span style={{ color: theme.text, fontWeight: 600 }}>
-            {daysWithCals.length}/{days.length}
+          <span
+            style={{
+              fontSize: 11,
+              color: theme.textDim,
+              transition: "transform 0.2s",
+              transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+              display: "inline-block",
+            }}
+          >
+            &#9660;
           </span>
-        </span>
+        </div>
+      </div>
+
+      {/* Expanded content */}
+      <div
+        style={{
+          maxHeight: expanded ? 500 : 0,
+          overflow: "hidden",
+          transition: "max-height 0.3s ease",
+        }}
+      >
+        <div style={{ padding: "0 14px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Insight banner */}
+          <div
+            style={{
+              background: theme.macroBoxBg,
+              borderRadius: 8,
+              padding: "8px 12px",
+              fontSize: 12,
+              lineHeight: 1.5,
+              color: theme.text,
+              borderLeft: `3px solid ${grade.color}`,
+            }}
+          >
+            {insight}
+          </div>
+
+          {/* Stats grid */}
+          {hasData && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              {/* Calories */}
+              <div style={{ background: theme.macroBoxBg, borderRadius: 8, padding: "8px 10px", borderTop: "3px solid #a855f7" }}>
+                <div style={{ fontSize: 10, color: theme.textMuted }}>Calories</div>
+                {stats.trackedDays > 0 ? (
+                  <>
+                    <div style={{ ...mono, fontSize: 13, fontWeight: 600 }}>
+                      {Math.round(stats.totalCalsEaten).toLocaleString()}
+                    </div>
+                    <div style={{ fontSize: 10, color: theme.textMuted }}>
+                      / {Math.round(stats.totalCalsTarget).toLocaleString()} target
+                    </div>
+                    <div style={{
+                      ...mono,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      marginTop: 2,
+                      color: stats.totalCalsEaten <= stats.totalCalsTarget ? "#22c55e" : "#ef4444",
+                    }}>
+                      {stats.totalCalsEaten <= stats.totalCalsTarget ? "" : "+"}
+                      {Math.round(stats.totalCalsEaten - stats.totalCalsTarget)} kcal
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 11, color: theme.textDim }}>No data</div>
+                )}
+              </div>
+
+              {/* Weight */}
+              <div style={{ background: theme.macroBoxBg, borderRadius: 8, padding: "8px 10px", borderTop: "3px solid #60a5fa" }}>
+                <div style={{ fontSize: 10, color: theme.textMuted }}>Weight</div>
+                {stats.weightDelta !== null ? (
+                  <>
+                    <div style={{
+                      ...mono,
+                      fontSize: 13,
+                      fontWeight: 600,
+                      color: stats.weightDelta <= 0 ? "#22c55e" : "#ef4444",
+                    }}>
+                      {stats.weightDelta > 0 ? "+" : ""}{stats.weightDelta} kg
+                    </div>
+                    <div style={{ fontSize: 10, color: theme.textMuted }}>
+                      {stats.weightStart} &rarr; {stats.weightEnd} kg
+                    </div>
+                  </>
+                ) : stats.avgWeight !== null ? (
+                  <>
+                    <div style={{ ...mono, fontSize: 13, fontWeight: 600 }}>{stats.avgWeight} kg</div>
+                    <div style={{ fontSize: 10, color: theme.textDim }}>single weigh-in</div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 11, color: theme.textDim }}>No weigh-ins</div>
+                )}
+              </div>
+
+              {/* Activity */}
+              <div style={{ background: theme.macroBoxBg, borderRadius: 8, padding: "8px 10px", borderTop: "3px solid #f59e0b" }}>
+                <div style={{ fontSize: 10, color: theme.textMuted }}>Activity</div>
+                <div style={{ ...mono, fontSize: 13, fontWeight: 600 }}>
+                  <span style={{ color: "#22c55e" }}>{stats.sportDays}</span>
+                  <span style={{ color: theme.textDim, fontSize: 11 }}> sport</span>
+                </div>
+                <div style={{ ...mono, fontSize: 13, fontWeight: 600 }}>
+                  <span style={{ color: "#ef4444" }}>{stats.restDays}</span>
+                  <span style={{ color: theme.textDim, fontSize: 11 }}> rest</span>
+                </div>
+                {stats.sugarTracked > 0 && (
+                  <div style={{ fontSize: 10, color: theme.textMuted, marginTop: 2 }}>
+                    Sugar OK: {stats.sugarCompliant}/{stats.sugarTracked}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Mini bar chart */}
+          {stats.trackedDays > 0 && (
+            <div style={{ background: theme.macroBoxBg, borderRadius: 8, padding: "8px 10px" }}>
+              <div style={{ fontSize: 10, color: theme.textMuted, marginBottom: 6 }}>
+                Daily calories (green = under target, red = over)
+              </div>
+              <MiniCalChart dailyCals={stats.dailyCals} theme={theme} />
+            </div>
+          )}
+
+          {/* Comparison with previous week */}
+          {prevStats && prevStats.trackedDays > 0 && stats.trackedDays > 0 && (
+            <div style={{ display: "flex", gap: 8, fontSize: 11, ...mono, flexWrap: "wrap" }}>
+              <span style={{ color: theme.textMuted }}>vs last week:</span>
+              {prevStats.avgDeficit !== null && stats.avgDeficit !== null && (
+                <span>
+                  deficit{" "}
+                  <span style={{
+                    color: stats.avgDeficit >= prevStats.avgDeficit ? "#22c55e" : "#ef4444",
+                    fontWeight: 600,
+                  }}>
+                    {stats.avgDeficit >= prevStats.avgDeficit ? "+" : ""}
+                    {stats.avgDeficit - prevStats.avgDeficit}
+                  </span>
+                </span>
+              )}
+              {prevStats.avgWeight !== null && stats.avgWeight !== null && (
+                <span>
+                  weight{" "}
+                  <span style={{
+                    color: stats.avgWeight <= prevStats.avgWeight ? "#22c55e" : "#ef4444",
+                    fontWeight: 600,
+                  }}>
+                    {stats.avgWeight <= prevStats.avgWeight ? "" : "+"}
+                    {Math.round((stats.avgWeight - prevStats.avgWeight) * 10) / 10} kg
+                  </span>
+                </span>
+              )}
+              <span>
+                tracking{" "}
+                <span style={{
+                  color: stats.trackedDays >= prevStats.trackedDays ? "#22c55e" : "#ef4444",
+                  fontWeight: 600,
+                }}>
+                  {stats.trackedDays >= prevStats.trackedDays ? "+" : ""}
+                  {stats.trackedDays - prevStats.trackedDays} days
+                </span>
+              </span>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1136,7 +1486,7 @@ export default function CutTracker() {
       {filter === "all"
         ? weekGroups.map((week, wi) => (
             <div key={wi}>
-              <WeeklySummary days={week} weekNum={wi + 1} theme={theme} />
+              <WeeklySummary days={week} weekNum={wi + 1} theme={theme} prevWeekDays={wi > 0 ? weekGroups[wi - 1] : null} />
               {week.map((day) => (
                 <div key={day.dayNum} id={day.isToday ? "day-today" : undefined}>
                   <DayRow
